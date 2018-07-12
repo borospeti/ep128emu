@@ -1,6 +1,6 @@
 
 // compressor utility for Enterprise 128 programs
-// Copyright (C) 2007-2016 Istvan Varga <istvanv@users.sourceforge.net>
+// Copyright (C) 2007-2018 Istvan Varga <istvanv@users.sourceforge.net>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -20,6 +20,8 @@
 #include "compress.hpp"
 #include "decompm2.hpp"
 #include "pngwrite.hpp"
+#include "compress6.hpp"
+#include "decompress6.hpp"
 
 #include <vector>
 
@@ -29,8 +31,7 @@ static bool   extractMode = false;
 static bool   testMode = false;
 // assume archive format (implies forceRawMode)
 static bool   archiveFormat = false;
-// compression type (0, 2, 3 or 5; default: 2, or auto-detect when
-// decompressing)
+// compression type (0 to 6; default: 2, or auto-detect when decompressing)
 static int    compressionType = -1;
 // compression level (1: fast, low compression ... 9: slow, high compression)
 static int    compressionLevel = 5;
@@ -48,6 +49,8 @@ static size_t maxOffset = 0;
 static size_t blockSize = 0;
 // volume size for compressed files (0: no volumes)
 static size_t volumeSize = 0;
+// encoding definition for compression type 6
+static const char *m6Encoding = (char *) 0;
 
 static int readInputFile(std::vector< unsigned char >& inBuf,
                          const char *fileName)
@@ -169,6 +172,26 @@ static bool isEPImageFile(const std::vector< unsigned char >& buf,
   return true;
 }
 
+static void decompressRawData(std::vector< unsigned char >& outBuf,
+                              const std::vector< unsigned char >& inBuf)
+{
+  if (compressionType == 6 && m6Encoding) {
+    Ep128Compress::Decompressor_M6  *decompressor =
+        new Ep128Compress::Decompressor_M6();
+    try {
+      decompressor->setEncoding(m6Encoding);
+      decompressor->decompressData(outBuf, inBuf);
+    }
+    catch (...) {
+      delete decompressor;
+      throw;
+    }
+    delete decompressor;
+    return;
+  }
+  Ep128Compress::decompressData(outBuf, inBuf, compressionType);
+}
+
 static void decompressFile(std::vector< unsigned char >& outBuf,
                            const std::vector< unsigned char >& inBuf,
                            int exosFileType = 0)
@@ -190,7 +213,7 @@ static void decompressFile(std::vector< unsigned char >& outBuf,
     // raw compressed data
     try {
       // try new format first (no start address in block headers)
-      Ep128Compress::decompressData(tmpBuf, inBuf, compressionType);
+      decompressRawData(tmpBuf, inBuf);
       outBuf.insert(outBuf.end(), tmpBuf.begin(), tmpBuf.end());
       return;
     }
@@ -264,6 +287,10 @@ static size_t compressFile(std::vector< unsigned char >& outBuf,
                     inBuf.begin() + skipBytes,
                     inBuf.begin() + skipBytes + length);
       compress = Ep128Compress::createCompressor(compressionType, tmpBuf2);
+      if (compressionType == 6 && m6Encoding) {
+        reinterpret_cast< Ep128Compress::Compressor_M6 * >
+            (compress)->setEncoding(m6Encoding);
+      }
       Ep128Compress::Compressor::CompressionParameters  config;
       compress->getCompressionParameters(config);
       config.setCompressionLevel(compressionLevel);
@@ -284,7 +311,7 @@ static size_t compressFile(std::vector< unsigned char >& outBuf,
         tmpBuf.insert(tmpBuf.end(), tmpBufs[i].begin() + 2, tmpBufs[i].end());
     }
     else {
-      Ep128Compress::decompressData(tmpBuf, tmpBuf2, compressionType);
+      decompressRawData(tmpBuf, tmpBuf2);
     }
     if (tmpBuf.size() != length)
       throw Ep128Emu::Exception("internal error compressing data");
@@ -362,23 +389,20 @@ int main(int argc, char **argv)
         if (++i >= argc)
           throw Ep128Emu::Exception("missing argument for -m");
         compressionType = int(std::atoi(argv[i]));
-        if (!(compressionType == -1 || compressionType == 0 ||
-              compressionType == 2 || compressionType == 3 ||
-              compressionType == 5)) {
+        if (!(compressionType >= -1 && compressionType <= 6))
           throw Ep128Emu::Exception("invalid compression type");
-        }
       }
-      else if (tmp == "-m0") {
-        compressionType = 0;
-      }
-      else if (tmp == "-m2") {
-        compressionType = 2;
-      }
-      else if (tmp == "-m3") {
-        compressionType = 3;
+      else if (tmp.length() == 3 && tmp[0] == '-' && tmp[1] == 'm' &&
+               tmp[2] >= '0' && tmp[2] <= '6') {
+        compressionType = int(tmp[2] - '0');
       }
       else if (tmp == "-mz") {
         compressionType = 5;
+      }
+      else if (tmp.length() > 4 && tmp[0] == '-' && tmp[1] == 'm' &&
+               tmp[2] == '6' && tmp[3] == ':') {
+        compressionType = 6;
+        m6Encoding = argv[i] + 4;
       }
       else if (tmp.length() == 2 && (tmp[1] >= '1' && tmp[1] <= '9')) {
         compressionLevel = int(tmp[1] - '0');
@@ -552,24 +576,26 @@ int main(int argc, char **argv)
       }
     }
     if (!maxOffset) {
-      maxOffset = ((compressionType == 0 || compressionType == 2) ?
-                   65536 : (compressionType == 3 ? 65535 : 32768));
+      maxOffset = (compressionType == 3 ?
+                   65535 : (compressionType == 5 ? 32768 : 65536));
     }
     if (maxOffset > 65536) {
-      if (!(forceRawMode && compressionType == 2)) {
+      if (!(forceRawMode &&
+            (compressionType == 1 || compressionType == 2 ||
+             compressionType == 4 || compressionType == 6))) {
         throw Ep128Emu::Exception("-maxoffs > 65536 requires -m2 and "
                                   "-a or -raw");
       }
       std::fprintf(stderr, "WARNING: -maxoffs > 65536 currently "
                            "cannot be decompressed on the Enterprise\n");
     }
-    if (compressionType == 5) {
-      if (!forceRawMode)
-        throw Ep128Emu::Exception("ZLib format (-mz) requires -a or -raw");
-      if (maxOffset > 32768) {
-        std::fprintf(stderr, "WARNING: using non-standard ZLib (-mz) format "
-                             "with -maxoffs > 32768\n");
-      }
+    if (compressionType != 0 && compressionType != 2 && compressionType != 3 &&
+        !forceRawMode) {
+      throw Ep128Emu::Exception("output format requires -a or -raw");
+    }
+    if (compressionType == 5 && maxOffset > 32768) {
+      std::fprintf(stderr, "WARNING: using non-standard ZLib (-mz) format "
+                           "with -maxoffs > 32768\n");
     }
     std::vector< unsigned char >  outBuf;
     std::vector< unsigned char >  inBuf;
@@ -663,10 +689,12 @@ int main(int argc, char **argv)
       std::printf("        interpret all remaining arguments as file names\n");
       std::printf("    -h | -help | --help\n");
       std::printf("        print usage information\n");
-      std::printf("    -m0 | -m2 | -m3 | -mz\n");
+      std::printf("    -m0..m6 | -mz\n");
       std::printf("        select compression type (default: 2, or "
                   "automatically detected\n"
                   "        when decompressing)\n");
+      std::printf("    -m6:ENCODING\n");
+      std::printf("        select compression type 6 with custom encoding\n");
       std::printf("    -1 ... -9\n");
       std::printf("        set compression level vs. speed (default: 5)\n");
       std::printf("    -X\n");
